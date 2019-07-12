@@ -1,7 +1,11 @@
 // tslint:disable:no-console
 import * as ts from "typescript";
+import * as utils from 'tsutils'
+import { minBy, findLastIndex } from 'lodash'
 
 const REACT_REGEX = /['"]react['"]/;
+
+type HoistState = [ts.VariableStatement, ts.Node?, ts.Node?]
 
 /**
  * Check if node is a prologue directive (e.g "use strict")
@@ -34,12 +38,16 @@ function isReactImport(node: ts.Node, sf: ts.SourceFile): boolean {
  * @param {ts.JsxAttributeLike} attr attribute
  * @returns {boolean} true if mutable, false otherwise
  */
-function isMutableProp(attr: ts.JsxAttributeLike): boolean {
+function isMutableProp(attr: ts.JsxAttributeLike, opt?: Opts) {
   // {...props} spread operator's definitely mutable
   if (ts.isJsxSpreadAttribute(attr)) {
     return true;
   }
-  const { initializer } = attr;
+  const { initializer, name } = attr;
+  if (name.getText() === 'ref') {
+    return true
+  }
+
   // cases like <button enabled />
   if (!initializer) {
     return false;
@@ -50,47 +58,145 @@ function isMutableProp(attr: ts.JsxAttributeLike): boolean {
   }
 
   if (ts.isJsxExpression(initializer)) {
-    const { expression } = initializer;
-    if (
-      // foo={true}
-      expression.kind === ts.SyntaxKind.TrueKeyword ||
-      // foo={false}
-      expression.kind === ts.SyntaxKind.FalseKeyword ||
-      // foo={1}
-      ts.isNumericLiteral(expression) ||
-      // foo={"asd"}
-      ts.isStringLiteral(expression)
-    ) {
-      return false;
-    }
+    return isMutableExpression(initializer, opt)
   }
   return true;
 }
 
-/**
- * Check if element is considered a constant element
- *
- * @param {ts.Node} el element to check
- * @returns {boolean}
- */
-function isConstantElement(
-  el: ts.Node
-): el is ts.JsxSelfClosingElement & boolean {
-  // We only handle self-closing el for now
-  // e.g: <img src="foo"/>
-  // TODO: We can support immutable children but later
-  if (!ts.isJsxSelfClosingElement(el)) {
-    return false;
+function isMutableExpression(expression: ts.Expression, opt?: Opts): boolean | ts.Identifier[] {
+  if (opt && opt.constantReg && opt.constantReg.test(expression.getText())) {
+    return false
   }
+  if (
+    // foo={true}
+    expression.kind === ts.SyntaxKind.TrueKeyword ||
+    // foo={false}
+    expression.kind === ts.SyntaxKind.FalseKeyword ||
+    // foo={1}
+    ts.isNumericLiteral(expression) ||
+    // foo={"asd"}
+    ts.isStringLiteral(expression)
+  ) {
+    return false;
+  } else if (ts.isIdentifier(expression)) {
+    return [expression]
+  } else if (ts.isPropertyAccessExpression(expression)) {
+    return isMutableExpression(expression.expression, opt)
+  } else if (ts.isBinaryExpression(expression)) {
+    return isMutableOverAll(
+      () => isMutableExpression(expression.left, opt),
+      () => isMutableExpression(expression.right, opt)
+    )
+  } else if (ts.isElementAccessExpression(expression)) {
+    return isMutableOverAll(
+      () => isMutableExpression(expression.expression, opt),
+      () => isMutableExpression(expression.argumentExpression, opt)
+    )
+  } else if (ts.isConditionalExpression(expression)) {
+    return isMutableOverAll(
+      () => isMutableExpression(expression.condition, opt),
+      () => isMutableExpression(expression.whenFalse, opt),
+      () => isMutableExpression(expression.whenTrue, opt)
+    )
+  } else if (ts.isJsxExpression(expression)) {
+    return isMutableExpression(expression.expression, opt)
+  } else if (ts.isPrefixUnaryExpression(expression)) {
+    if (expression.operator === ts.SyntaxKind.ExclamationToken || expression.operator === ts.SyntaxKind.TildeToken)
+      return isMutableExpression(expression.operand)
+  } else if (ts.isTemplateExpression(expression)) {
+    if (expression.templateSpans.length) {
+      return isMutableOverAll(
+        ...expression.templateSpans.map(s => () => isMutableExpression(s.expression))
+      )
+    }
+    return false
+  } else if (opt.aggressive && ts.isCallExpression(expression)) {
+    return isMutableOverAll(
+      () => isMutableExpression(expression.expression),
+      ...expression.arguments.map(a => () => isMutableExpression(a)),
+    )
+  }
+  return true
+}
 
-  // No attributes, e.g <br/>
-  return (
-    !el.attributes ||
-    !el.attributes.properties ||
-    !el.attributes.properties.length ||
-    // no mutable prop
-    !el.attributes.properties.find(isMutableProp)
-  );
+function isMutableElement(el: ts.Node, opt?: Opts): boolean | ts.Identifier[] {
+  if (ts.isJsxSelfClosingElement(el) || ts.isJsxOpeningElement(el)) {
+    return isMutableJsxElement(el, opt)
+  } else if (ts.isJsxText(el) || ts.isJsxClosingElement(el) || ts.isJsxClosingFragment(el) || ts.isJsxOpeningFragment(el)) {
+    return false
+  } else if (ts.isJsxElement(el)) {
+    const res = isMutableOverAll(
+      () => isMutableElement(el.openingElement, opt),
+      ...el.children.map(c => () => isMutableElement(c, opt))
+    )
+    // console.log(el.getText(), (res !== true && res as any !== false) ? (res as any).map((r: any) => r.getText()) : res)
+    return res
+  } else if (ts.isJsxExpression(el)) {
+    return isMutableExpression(el, opt)
+  } else if (ts.isJsxFragment(el)) {
+    return isMutableOverAll(
+      ...el.children.map(c => () => isMutableElement(c, opt))
+    )
+  }
+  return true
+}
+
+function isMutableJsxElement(el: ts.JsxSelfClosingElement | ts.JsxOpeningElement, opt?: Opts) {
+  return isMutableOverAll(
+    () => isMutableTagName(el.tagName),
+    () => {
+      return el.attributes && el.attributes.properties && el.attributes.properties.length &&
+        isMutableOverAll(
+          ...el.attributes.properties.map(p => () => isMutableProp(p, opt))
+        )
+    }
+  )
+}
+
+function isMutableOverAll(...funcs: (() => boolean | ts.Identifier | ts.Identifier[])[]) {
+  let ids: ts.Identifier[] = []
+  for (let index = 0; index < funcs.length; index++) {
+    const res = funcs[index]()
+    if (res === true) {
+      return true
+    }
+    if (res) {
+      ids = ids.concat(res)
+    }
+  }
+  return ids.length ? ids : false
+}
+
+function isMutableTagName(tagName: ts.JsxTagNameExpression) {
+  if (ts.isIdentifier(tagName)) {
+    if (tagName.getText().match(/^[a-z]/)) {
+      return false
+    }
+    return tagName
+  }
+  return true
+}
+
+function isJsxElement(node: ts.Node) {
+  return ts.isJsxElement(node) || ts.isJsxSelfClosingElement(node) || ts.isJsxFragment(node) || ts.isJsxText(node)
+}
+
+function lookUpForRealScope(node: ts.Node) {
+  let cur = node.parent || node
+  while (
+    cur.parent
+    && !ts.isFunctionDeclaration(cur)
+    && !ts.isFunctionExpression(cur)
+    && !ts.isMethodDeclaration(cur)
+    && !ts.isArrowFunction(cur)
+    && !ts.isForInStatement(cur)
+    && !ts.isForOfStatement(cur)
+    && !ts.isForStatement(cur)
+    && !ts.isSourceFile(cur)
+  ) {
+    cur = cur.parent
+  }
+  return cur
 }
 
 /**
@@ -104,27 +210,282 @@ function isConstantElement(
  */
 function constantElementVisitor(
   ctx: ts.TransformationContext,
-  hoistedVariables: ts.VariableStatement[]
+  hoistedVariables: HoistState[],
+  opt?: Opts
 ): ts.Visitor {
   const visitor: ts.Visitor = node => {
-    if (isConstantElement(node)) {
-      const variable = ts.createUniqueName("hoisted_constant_element");
-      const statement = ts.createVariableStatement(
-        undefined,
-        ts.createVariableDeclarationList([
-          ts.createVariableDeclaration(variable, undefined, node)
-        ])
-      );
-      // Store the variable assignement to hoist later
-      hoistedVariables.push(statement);
+    if (ts.isJsxText(node)) return node
+    const mutableResult = !isJsxElement(node) || isMutableElement(node, opt)
+    if (mutableResult !== true) {
+      const nearestDeclaration = mutableResult && minBy(mutableResult.map(r => findNearestScope(r)), s => s[1])[0]
+      const variable = ts.createUniqueName('hoisted');
 
-      // Replace <foo /> with {hoisted_constant_element_1}
-      // TODO: Figure out case like `return <foo />
-      return ts.createJsxExpression(undefined, variable);
+      if (!isNodeEqual(lookUpForRealScope(nearestDeclaration), lookUpForRealScope(node))) {
+
+        const shouldLazy = opt.lazyFunc && mutableResult
+
+        const jsxNode: ts.Expression = shouldLazy
+          ? ts.createCall(
+            ts.createPropertyAccess(
+              ts.createIdentifier('_'),
+              ts.createIdentifier('memoize'),
+            ), undefined, [
+              ts.createArrowFunction(undefined, undefined, [], undefined, ts.createToken(ts.SyntaxKind.EqualsGreaterThanToken), node as any)
+            ]
+          )
+          : node as any
+
+        const statement = ts.createVariableStatement(
+          undefined,
+          ts.createVariableDeclarationList([
+            ts.createVariableDeclaration(variable, undefined, jsxNode)
+          ], ts.NodeFlags.Const)
+        );
+
+        const nearestScope = lookUpForScope(nearestDeclaration)
+
+        // Store the variable assignement to hoist later
+        hoistedVariables.push([statement, ts.isSourceFile(nearestScope) ? undefined : nearestScope, nearestDeclaration]);
+
+        // Replace <foo /> with {hoisted_constant_element_1}
+        // TODO: Figure out case like `return <foo />
+        return shouldLazy ? ts.createJsxExpression(undefined, ts.createCall(variable, undefined, [])) : ts.createJsxExpression(undefined, variable);
+      }
     }
-    return ts.visitEachChild(node, visitor, ctx);
+    try {
+      return ts.visitEachChild(node, visitor, ctx);
+    } catch {
+      return node
+    }
   };
   return visitor;
+}
+function isNodeEqual(l?: ts.Node, r?: ts.Node) {
+  try {
+    return l && r && l.getFullText() === r.getFullText() && l.pos === r.pos && l.end === r.end
+  } catch {
+    return false
+  }
+}
+
+function createStatements(matched: HoistState[], initialStatements: readonly ts.Statement[]) {
+  return matched.reduce((res, m) => {
+    const index = res.findIndex(s => isNodeEqual(m[2], s))
+    if (index < 0) {
+      return [m[0], ...res]
+    }
+    return [
+      ...res.slice(0, index + 1),
+      m[0],
+      ...res.slice(index - res.length + 1)
+    ]
+  }, initialStatements)
+}
+
+function scopeDeclarationVisitor(
+  ctx: ts.TransformationContext,
+  hoistedVariables: HoistState[]
+): ts.Visitor {
+  const visitor: ts.Visitor = node => {
+    const matched = hoistedVariables.filter(v => node.pos === v[1].pos)
+    if (matched.length) {
+      const statements = matched.map(m => m[0])
+      const scope = node
+      if (ts.isBlock(scope)) {
+        return ts.createBlock(createStatements(matched, scope.statements.map(s => ts.visitNode(s, visitor))))
+      } else if (ts.isFunctionExpression(scope)) {
+        return ts.updateFunctionExpression(
+          scope,
+          scope.modifiers,
+          scope.asteriskToken,
+          scope.name,
+          scope.typeParameters,
+          scope.parameters,
+          scope.type,
+          ts.createBlock(createStatements(matched, ts.visitNode<ts.Block>(scope.body, visitor).statements))
+        )
+      } else if (ts.isArrowFunction(scope)) {
+        return ts.updateArrowFunction(
+          scope,
+          scope.modifiers,
+          scope.typeParameters,
+          scope.parameters,
+          scope.type,
+          scope.equalsGreaterThanToken,
+          ts.isBlock(scope.body)
+            ? ts.createBlock(createStatements(matched, ts.visitNode<ts.Block>(scope.body, visitor).statements))
+            : ts.createBlock([
+              ...statements,
+              ts.createReturn(scope.body)
+            ])
+        )
+      } else if (ts.isFunctionDeclaration(scope)) {
+        return ts.updateFunctionDeclaration(
+          scope,
+          scope.decorators,
+          scope.modifiers,
+          scope.asteriskToken,
+          scope.name,
+          scope.typeParameters,
+          scope.parameters,
+          scope.type,
+          ts.createBlock(createStatements(matched, ts.visitNode<ts.Block>(scope.body, visitor).statements))
+        )
+      } else if (ts.isMethodDeclaration(scope)) {
+        return ts.updateMethod(
+          scope,
+          scope.decorators,
+          scope.modifiers,
+          scope.asteriskToken,
+          scope.name,
+          scope.questionToken,
+          scope.typeParameters,
+          scope.parameters,
+          scope.type,
+          ts.createBlock(createStatements(matched, ts.visitNode<ts.Block>(scope.body, visitor).statements))
+        )
+      } else if (ts.isForStatement(scope)) {
+
+        return ts.updateFor(scope, scope.initializer, scope.condition, scope.incrementor, ts.createBlock(
+          createStatements(
+            matched,
+            ts.isBlock(scope.statement)
+              ? scope.statement.statements.map(s => ts.visitNode(s, visitor))
+              : [ts.visitNode(scope.statement, visitor)]
+          )
+        ))
+      } else if (ts.isForInStatement(scope)) {
+        return ts.updateForIn(scope, scope.initializer, scope.expression, ts.createBlock(
+          createStatements(
+            matched,
+            ts.isBlock(scope.statement)
+              ? scope.statement.statements.map(s => ts.visitNode(s, visitor))
+              : [ts.visitNode(scope.statement, visitor)]
+          )
+        ))
+      } else if (ts.isForOfStatement(scope)) {
+        return ts.updateForOf(scope, scope.awaitModifier, scope.initializer, scope.expression, ts.createBlock(
+          createStatements(
+            matched,
+            ts.isBlock(scope.statement)
+              ? scope.statement.statements.map(s => ts.visitNode(s, visitor))
+              : [ts.visitNode(scope.statement, visitor)]
+          )
+        ))
+      } else if (ts.isCaseClause(scope)) {
+        return ts.updateCaseClause(scope, scope.expression, createStatements(matched, scope.statements.map(s => ts.visitNode(s, visitor))))
+      }
+    }
+    return ts.visitEachChild(node, visitor, ctx)
+  }
+
+  return visitor
+}
+
+function findNearestScope(id: ts.Identifier) {
+  let cur: ts.Node = id
+  let height = 0
+  while (cur) {
+    while (!(utils.isScopeBoundary(cur) || ts.isCaseClause(cur)) && cur.parent) {
+      cur = cur.parent
+    }
+    const res = findDeclaration(cur, id)
+
+    if (res) {
+      return [res, height] as const
+    }
+    if (!cur.parent) {
+      return [cur, height] as const
+    }
+    cur = cur.parent
+    height += 1
+  }
+}
+
+function findBinding(name: ts.BindingName, id: ts.Identifier): ts.Node | undefined {
+  if (ts.isIdentifier(name) && name.getText() === id.getText()) {
+    return name
+  } else if (ts.isObjectBindingPattern(name)) {
+    return name.elements.find(e => findBinding(e.name, id))
+  } else if (ts.isArrayBindingPattern(name)) {
+    return name.elements.find(e => ts.isBindingElement(e) && findBinding(e.name, id))
+  }
+}
+
+function findDeclaration(node: ts.Node, id: ts.Identifier): ts.Node | undefined {
+  const lookUp = (node: ts.Node): ts.Node | undefined => {
+    if (
+      (
+        ts.isVariableDeclaration(node)
+        || ts.isImportSpecifier(node)
+        || ts.isImportClause(node)
+      ) && node.name
+    ) {
+      const name = node.name
+      const bindingEle = findBinding(name, id)
+      if (bindingEle) {
+        return bindingEle
+      }
+    }
+
+    if (node.getChildCount()) {
+      for (const c of node.getChildren()) {
+        const res = lookUp(c)
+        if (res) {
+          return res
+        }
+      }
+    }
+  }
+
+  if (ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node) || ts.isMethodDeclaration(node) || ts.isArrowFunction(node)) {
+    for (const parameter of node.parameters) {
+      if (findBinding(parameter.name, id)) {
+        return parameter
+      }
+    }
+    if (node.body) {
+      return findDeclaration(node.body, id)
+    }
+  }
+
+  if (ts.isForStatement(node) || ts.isForInStatement(node) || ts.isForOfStatement(node)) {
+    if (node.initializer && ts.isVariableDeclarationList(node.initializer) && lookUp(node.initializer)) {
+      return node.initializer
+    }
+    return findDeclaration(node.statement, id)
+  }
+
+  if (node.getChildCount()) {
+    for (const child of ts.isBlock(node) || ts.isCaseClause(node) ? node.statements : node.getChildren()) {
+      if ((ts.isVariableStatement(child) || ts.isImportDeclaration(child)) && lookUp(child)) {
+        return child
+      } else if (ts.isClassDeclaration(child) && child.name && findBinding(child.name, id)) {
+        return child
+      } else if (ts.isFunctionDeclaration(child) && child.name && findBinding(child.name, id)) {
+        return child
+      }
+    }
+  }
+}
+
+function lookUpForScope(node: ts.Node) {
+  let cur = node.parent || node // todo ??
+  while (cur.parent
+    && !ts.isBlock(cur)
+    && !ts.isFunctionExpression(cur)
+    && !ts.isSourceFile(cur)
+    && !ts.isArrowFunction(cur)
+    && !ts.isFunctionDeclaration(cur)
+    && !ts.isMethodDeclaration(cur)
+    && !ts.isForInStatement(cur)
+    && !ts.isForOfStatement(cur)
+    && !ts.isForStatement(cur)
+    && !ts.isCaseClause(cur)
+  ) {
+    cur = cur.parent
+  }
+  return cur
 }
 
 function visitSourceFile(
@@ -142,35 +503,46 @@ function visitSourceFile(
   const firstHoistableNodeIndex = sf.statements.findIndex(
     node => isNotPrologueDirective(node) && isReactImport(node, sf)
   );
+
   // Can't find where to hoist
   if (!~firstHoistableNodeIndex) {
     return sf;
   }
 
-  const hoistedVariables: ts.VariableStatement[] = [];
-  const elVisitor = constantElementVisitor(ctx, hoistedVariables);
+  const lastImportIndex = findLastIndex(sf.statements, node => {
+    return ts.isImportDeclaration(node)
+      || (ts.isVariableStatement(node) &&
+        node.declarationList.declarations.some(
+          ({ initializer: i }) => i && i.getText().startsWith('require')
+        ))
+  })
 
+  let hoistedVariables: HoistState[] = [];
+  const elVisitor = constantElementVisitor(ctx, hoistedVariables, opts);
   // We assume we only care about nodes after React import
   const transformedStatements = sf.statements
-    .slice(firstHoistableNodeIndex + 1, sf.statements.length)
+    .slice(lastImportIndex + 1, sf.statements.length)
     .map(node => ts.visitNode(node, elVisitor));
+
+  const deVisitor = scopeDeclarationVisitor(ctx, hoistedVariables.filter(v => v[1]))
+  const transformedAgain = transformedStatements.map(node => ts.visitNode(node, deVisitor))
   if (opts.verbose) {
     console.log(
-      `Hoisting ${hoistedVariables.length} elements in ${sf.fileName}:`
+      `\r\nHoisting ${hoistedVariables.length} elements in ${sf.fileName}:\r\n`
     );
-    hoistedVariables.forEach(n =>
-      console.log(n.declarationList.declarations[0].initializer.getText(sf))
-    );
+    // hoistedVariables.forEach(n =>
+    //   console.log(n.declarationList.declarations[0].initializer.getText(sf))
+    // );
   }
 
   return ts.updateSourceFileNode(
     sf,
     ts.setTextRange(
       ts.createNodeArray([
-        ...sf.statements.slice(0, firstHoistableNodeIndex + 1),
+        ...sf.statements.slice(0, lastImportIndex + 1),
         // Inject hoisted variables
-        ...hoistedVariables,
-        ...transformedStatements
+        ...hoistedVariables.filter(v => !v[1]).map(v => v[0]),
+        ...transformedAgain
       ]),
       sf.statements
     )
@@ -178,7 +550,10 @@ function visitSourceFile(
 }
 
 export interface Opts {
-  verbose?: boolean;
+  verbose?: boolean
+  constantReg?: RegExp
+  aggressive?: boolean
+  lazyFunc?: string
 }
 
 export function transform(
